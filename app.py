@@ -23,8 +23,8 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-if "query_input" not in st.session_state:
-    st.session_state["query_input"] = ""
+if "query_draft" not in st.session_state:
+    st.session_state["query_draft"] = ""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -59,14 +59,30 @@ def normalize_result(result):
     return str(result), "string"
 
 
-def get_child_tag_counts(elements: list) -> dict:
+def get_child_tag_samples(elements: list) -> dict:
+    """Returns {tag_name: (first_sample_tag, count)}."""
     counts: Counter = Counter()
+    samples: dict = {}
     for el in elements:
         if isinstance(el, bs4.Tag):
             for child in el.children:
                 if isinstance(child, bs4.Tag):
                     counts[child.name] += 1
-    return counts
+                    if child.name not in samples:
+                        samples[child.name] = child
+    return {name: (samples[name], count) for name, count in counts.items()}
+
+
+def _collapsed_tag_label(tag: bs4.Tag, count: int, max_len: int = 42) -> str:
+    """Chrome DevTools-style collapsed opening tag, e.g. <div class="foo" id="bar">  ×3"""
+    parts = [f"<{tag.name}"]
+    for k, v in (tag.attrs or {}).items():
+        val = " ".join(v) if isinstance(v, list) else str(v)
+        parts.append(f' {k}="{val}"')
+    opening = "".join(parts) + ">"
+    if len(opening) > max_len:
+        opening = opening[:max_len] + "…>"
+    return opening + (f"  ×{count}" if count > 1 else "")
 
 
 # ── DevTools tree renderer ────────────────────────────────────────────────────
@@ -196,7 +212,7 @@ def render_devtools_tree(elements: list):
 
 # ── Programmatic navigation ───────────────────────────────────────────────────
 def push_query(new_query: str):
-    st.session_state["query_input"] = new_query
+    st.session_state["query_draft"] = new_query
     st.session_state["auto_run"] = True
     st.rerun()
 
@@ -280,12 +296,13 @@ if history:
             if st.button(label, key=f"hist_{i}", help=h, use_container_width=True):
                 push_query(h)
 
-# Expression input
+# Expression input — value= (not key=) so push_query() can set query_draft freely
 query: str = st.text_input(
     "BS4 expression",
     placeholder='scope.select("div.title")  or  scope.find_all("a", href=True)',
-    key="query_input",
+    value=st.session_state["query_draft"],
 )
+st.session_state["query_draft"] = query
 
 run = st.button("Run", type="primary", disabled=not (query and soup))
 
@@ -361,16 +378,16 @@ if soup:
         def _child_query(t: str) -> str:  # noqa: F811
             return f"[c for c in scope.children if getattr(c, 'name', None) == '{t}']"
 
-    child_counts = get_child_tag_counts(child_source)
-    if child_counts:
+    child_samples = get_child_tag_samples(child_source)
+    if child_samples:
         st.divider()
         st.caption(child_label)
-        sorted_children = sorted(child_counts.items(), key=lambda x: -x[1])[:8]
+        sorted_children = sorted(child_samples.items(), key=lambda x: -x[1][1])[:8]
         btn_cols = st.columns(len(sorted_children))
-        for i, (tag_name, count) in enumerate(sorted_children):
+        for i, (tag_name, (sample_tag, count)) in enumerate(sorted_children):
             with btn_cols[i]:
                 if st.button(
-                    f"<{tag_name}>  {count}",
+                    _collapsed_tag_label(sample_tag, count),
                     key=f"child_{tag_name}",
                     use_container_width=True,
                 ):
