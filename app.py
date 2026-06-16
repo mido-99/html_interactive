@@ -347,22 +347,31 @@ if should_run:
         if tags:
             render_devtools_tree(tags)
 
-        # ── Children drill-down buttons ───────────────────────────────────────
-        child_counts = get_child_tag_counts(tags)
-        if child_counts:
-            st.caption("Children — click to drill in:")
-            # Sort by count desc, cap at 8 buttons
-            sorted_children = sorted(child_counts.items(), key=lambda x: -x[1])[:8]
-            btn_cols = st.columns(len(sorted_children))
-            for i, (tag_name, count) in enumerate(sorted_children):
-                with btn_cols[i]:
-                    if st.button(
-                        f"<{tag_name}>  {count}",
-                        key=f"child_{tag_name}",
-                        use_container_width=True,
-                    ):
-                        new_q = (
-                            f"[c for el in results for c in el.children"
-                            f" if getattr(c, 'name', None) == '{tag_name}']"
-                        )
-                        push_query(new_q)
+# ── Children drill-down (always visible once HTML is loaded) ─────────────────
+if soup:
+    last_results = st.session_state["last_results"]
+    if last_results:
+        child_source = last_results
+        child_label = "Children of results — click to drill in:"
+        def _child_query(t: str) -> str:
+            return f"[c for el in results for c in el.children if getattr(c, 'name', None) == '{t}']"
+    else:
+        child_source = [scope] if scope else []
+        child_label = f"Children of `{scope_choice}` — click to query:"
+        def _child_query(t: str) -> str:  # noqa: F811
+            return f"[c for c in scope.children if getattr(c, 'name', None) == '{t}']"
+
+    child_counts = get_child_tag_counts(child_source)
+    if child_counts:
+        st.divider()
+        st.caption(child_label)
+        sorted_children = sorted(child_counts.items(), key=lambda x: -x[1])[:8]
+        btn_cols = st.columns(len(sorted_children))
+        for i, (tag_name, count) in enumerate(sorted_children):
+            with btn_cols[i]:
+                if st.button(
+                    f"<{tag_name}>  {count}",
+                    key=f"child_{tag_name}",
+                    use_container_width=True,
+                ):
+                    push_query(_child_query(tag_name))
