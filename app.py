@@ -1,9 +1,7 @@
 import html as html_lib
-from collections import Counter
 
 import bs4
 import streamlit as st
-import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="Scraping Debugger", layout="wide")
@@ -15,19 +13,16 @@ for key, default in {
     "html_source": "",
     "soup": None,
     "parser_used": "",
-    "query_history": [],
     "base_url": "",
-    "last_results": [],
-    "auto_run": False,
+    "nav_levels": [],
+    "_lid_counter": 0,
+    "explore": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-if "query_draft" not in st.session_state:
-    st.session_state["query_draft"] = ""
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Core helpers ──────────────────────────────────────────────────────────────
 def parse_html(raw: str):
     try:
         soup = BeautifulSoup(raw, "lxml")
@@ -59,22 +54,7 @@ def normalize_result(result):
     return str(result), "string"
 
 
-def get_child_tag_samples(elements: list) -> dict:
-    """Returns {tag_name: (first_sample_tag, count)}."""
-    counts: Counter = Counter()
-    samples: dict = {}
-    for el in elements:
-        if isinstance(el, bs4.Tag):
-            for child in el.children:
-                if isinstance(child, bs4.Tag):
-                    counts[child.name] += 1
-                    if child.name not in samples:
-                        samples[child.name] = child
-    return {name: (samples[name], count) for name, count in counts.items()}
-
-
 def _collapsed_tag_label(tag: bs4.Tag, count: int, max_len: int = 42) -> str:
-    """Chrome DevTools-style collapsed opening tag, e.g. <div class="foo" id="bar">  ×3"""
     parts = [f"<{tag.name}"]
     for k, v in (tag.attrs or {}).items():
         val = " ".join(v) if isinstance(v, list) else str(v)
@@ -210,11 +190,74 @@ def render_devtools_tree(elements: list):
     components.html("\n".join(parts), height=height, scrolling=True)
 
 
-# ── Programmatic navigation ───────────────────────────────────────────────────
-def push_query(new_query: str):
-    st.session_state["query_draft"] = new_query
-    st.session_state["auto_run"] = True
-    st.rerun()
+# ── Nav level helpers ─────────────────────────────────────────────────────────
+def next_lid() -> int:
+    st.session_state["_lid_counter"] += 1
+    return st.session_state["_lid_counter"]
+
+
+def make_level(elements: list) -> dict:
+    return {"lid": next_lid(), "elements": elements, "query": "", "history": [], "active_child": None}
+
+
+def list_child_elements(source_elements: list, cap: int = 40) -> tuple:
+    children, total = [], 0
+    for el in source_elements:
+        if isinstance(el, bs4.Tag):
+            for c in el.children:
+                if isinstance(c, bs4.Tag):
+                    total += 1
+                    if len(children) < cap:
+                        children.append(c)
+    return children, total
+
+
+# ── Callbacks (run before widgets instantiate — safe to mutate session state) ─
+def _find_level_idx(lid: int):
+    for i, lv in enumerate(st.session_state["nav_levels"]):
+        if lv["lid"] == lid:
+            return i
+    return None
+
+
+def on_query_change(lid: int):
+    idx = _find_level_idx(lid)
+    if idx is None:
+        return
+    new_val = st.session_state.get(f"qbox_{lid}", "")
+    level = st.session_state["nav_levels"][idx]
+    level["query"] = new_val
+    if new_val and new_val not in level["history"]:
+        level["history"] = ([new_val] + level["history"])[:5]
+    level["active_child"] = None
+    st.session_state["nav_levels"] = st.session_state["nav_levels"][: idx + 1]
+
+
+def drill_into(level_index: int, child_tag: bs4.Tag):
+    levels = st.session_state["nav_levels"]
+    if level_index >= len(levels):
+        return
+    levels[level_index]["active_child"] = child_tag
+    st.session_state["nav_levels"] = levels[: level_index + 1] + [make_level([child_tag])]
+
+
+def apply_history(lid: int, text: str):
+    idx = _find_level_idx(lid)
+    if idx is None:
+        return
+    st.session_state[f"qbox_{lid}"] = text
+    level = st.session_state["nav_levels"][idx]
+    level["query"] = text
+    level["active_child"] = None
+    st.session_state["nav_levels"] = st.session_state["nav_levels"][: idx + 1]
+
+
+def on_scope_change():
+    choice = st.session_state.get("scope_radio", "body")
+    s = st.session_state.get("soup")
+    if s:
+        root_el = (s.body if s.body else s) if choice == "body" else s
+        st.session_state["nav_levels"] = [make_level([root_el])]
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -227,7 +270,6 @@ with st.sidebar:
 # ── Main ──────────────────────────────────────────────────────────────────────
 st.header("BS4 Parser")
 
-# HTML input
 paste_tab, upload_tab = st.tabs(["Paste HTML", "Upload File"])
 
 with paste_tab:
@@ -241,7 +283,7 @@ with paste_tab:
     if pasted and pasted != st.session_state["html_source"]:
         st.session_state["html_source"] = pasted
         st.session_state["soup"] = None
-        st.session_state["last_results"] = []
+        st.session_state["nav_levels"] = []
 
 with upload_tab:
     uploaded = st.file_uploader("Upload HTML file", type=["html", "htm", "txt"])
@@ -250,7 +292,7 @@ with upload_tab:
         if content != st.session_state["html_source"]:
             st.session_state["html_source"] = content
             st.session_state["soup"] = None
-            st.session_state["last_results"] = []
+            st.session_state["nav_levels"] = []
         st.success(f"Loaded {uploaded.name} ({len(content):,} chars)")
 
 base_url = st.text_input(
@@ -266,129 +308,124 @@ if html_source and st.session_state["soup"] is None:
     soup, parser = parse_html(html_source)
     st.session_state["soup"] = soup
     st.session_state["parser_used"] = parser
+    st.session_state["nav_levels"] = []
 
 soup = st.session_state.get("soup")
 if soup:
     st.caption(f"Parsed with **{st.session_state['parser_used']}** — {len(html_source):,} chars")
-
-st.divider()
-
-# ── Query ─────────────────────────────────────────────────────────────────────
-st.subheader("Query")
-
-# Scope selector
-scope_choice = st.radio(
-    "Scope",
-    ["body", "all"],
-    horizontal=True,
-    help="`body` → `scope = soup.body`   `all` → `scope = soup`",
-)
-scope = (soup.body if soup and soup.body else soup) if scope_choice == "body" else soup
-
-# History (max 5, shown as buttons)
-history: list = st.session_state["query_history"]
-if history:
-    st.caption("Recent:")
-    hist_cols = st.columns(len(history))
-    for i, h in enumerate(history):
-        with hist_cols[i]:
-            label = (h[:22] + "…") if len(h) > 22 else h
-            if st.button(label, key=f"hist_{i}", help=h, use_container_width=True):
-                push_query(h)
-
-# Expression input — value= (not key=) so push_query() can set query_draft freely
-query: str = st.text_input(
-    "BS4 expression",
-    placeholder='scope.select("div.title")  or  scope.find_all("a", href=True)',
-    value=st.session_state["query_draft"],
-)
-st.session_state["query_draft"] = query
-
-run = st.button("Run", type="primary", disabled=not (query and soup))
 
 if not html_source:
     st.info("Paste or upload HTML above to get started.")
 
 st.divider()
 
-# ── Eval ──────────────────────────────────────────────────────────────────────
-auto_run = st.session_state.get("auto_run", False)
-if auto_run:
-    del st.session_state["auto_run"]
-
-should_run = (run or auto_run) and query and soup
-
-if should_run:
-    if query not in history:
-        history.insert(0, query)
-        st.session_state["query_history"] = history[:5]
-
-    allowed_ns = {
-        "soup": soup,
-        "scope": scope,
-        "results": st.session_state["last_results"],
-        "Tag": bs4.Tag,
-        "NavigableString": bs4.NavigableString,
-        "ResultSet": bs4.ResultSet,
-        "BeautifulSoup": BeautifulSoup,
-        "re": __import__("re"),
-    }
-
-    try:
-        raw_result = eval(query, allowed_ns)  # noqa: S307
-    except Exception as exc:
-        st.error(f"Error: {exc}")
-        st.stop()
-
-    data, kind = normalize_result(raw_result)
-
-    if kind == "none":
-        st.warning("Result: None")
-    elif kind == "string":
-        st.subheader("Result")
-        st.code(data, language="text")
-    else:
-        tags = [el for el in data if isinstance(el, bs4.Tag)]
-        non_tags = [el for el in data if not isinstance(el, bs4.Tag)]
-
-        # Persist for next eval + children buttons
-        st.session_state["last_results"] = tags
-
-        st.metric("Results", len(data))
-
-        if non_tags:
-            st.caption("Non-tag items")
-            for item in non_tags:
-                st.code(str(item), language="text")
-
-        if tags:
-            render_devtools_tree(tags)
-
-# ── Children drill-down (always visible once HTML is loaded) ─────────────────
+# ── Hierarchical drill-down ───────────────────────────────────────────────────
 if soup:
-    last_results = st.session_state["last_results"]
-    if last_results:
-        child_source = last_results
-        child_label = "Children of results — click to drill in:"
-        def _child_query(t: str) -> str:
-            return f"[c for el in results for c in el.children if getattr(c, 'name', None) == '{t}']"
-    else:
-        child_source = [scope] if scope else []
-        child_label = f"Children of `{scope_choice}` — click to query:"
-        def _child_query(t: str) -> str:  # noqa: F811
-            return f"[c for c in scope.children if getattr(c, 'name', None) == '{t}']"
+    # Seed root level when nav_levels is empty
+    if not st.session_state["nav_levels"]:
+        scope_init = st.session_state.get("scope_radio", "body")
+        root_el = (soup.body if soup.body else soup) if scope_init == "body" else soup
+        st.session_state["nav_levels"] = [make_level([root_el])]
 
-    child_samples = get_child_tag_samples(child_source)
-    if child_samples:
-        st.divider()
-        st.caption(child_label)
-        sorted_children = sorted(child_samples.items(), key=lambda x: -x[1][1])[:8]
-        btn_cols = st.columns(len(sorted_children))
-        for i, (tag_name, (sample_tag, count)) in enumerate(sorted_children):
-            with btn_cols[i]:
-                if st.button(
-                    _collapsed_tag_label(sample_tag, count),
-                    key=f"child_{tag_name}",
-                    use_container_width=True,
-                ):
-                    push_query(_child_query(tag_name))
+    st.radio(
+        "Scope",
+        ["body", "all"],
+        horizontal=True,
+        key="scope_radio",
+        help="`body` → root is `soup.body`   `all` → root is `soup`",
+        on_change=on_scope_change,
+    )
+
+    for i, level in enumerate(st.session_state["nav_levels"]):
+        lid = level["lid"]
+        is_deepest = i == len(st.session_state["nav_levels"]) - 1
+
+        # Breadcrumb for child levels
+        if i > 0:
+            st.caption(f"└─ {_collapsed_tag_label(level['elements'][0], 1)}")
+
+        # Per-level history buttons
+        if level["history"]:
+            st.caption("Recent:")
+            hist_cols = st.columns(len(level["history"]))
+            for j, h in enumerate(level["history"]):
+                with hist_cols[j]:
+                    label = (h[:22] + "…") if len(h) > 22 else h
+                    st.button(
+                        label,
+                        key=f"hist_{lid}_{j}",
+                        help=h,
+                        use_container_width=True,
+                        on_click=apply_history,
+                        args=(lid, h),
+                    )
+
+        # Expression input — key is unique per lid; on_change fires on blur/Enter
+        st.text_input(
+            "BS4 expression" if i == 0 else f"Expression (level {i + 1})",
+            placeholder='scope.select("div.title")  or  scope.find_all("a", href=True)',
+            key=f"qbox_{lid}",
+            on_change=on_query_change,
+            args=(lid,),
+        )
+
+        # Eval query → compute source elements for child buttons
+        source_elements = level["elements"]
+        if level["query"]:
+            scope_el = level["elements"][0] if level["elements"] else soup
+            ns = {
+                "soup": soup,
+                "scope": scope_el,
+                "results": level["elements"],
+                "Tag": bs4.Tag,
+                "NavigableString": bs4.NavigableString,
+                "ResultSet": bs4.ResultSet,
+                "BeautifulSoup": BeautifulSoup,
+                "re": __import__("re"),
+            }
+            try:
+                raw = eval(level["query"], ns)  # noqa: S307
+                data, kind = normalize_result(raw)
+                if kind == "none":
+                    st.warning("Result: None")
+                elif kind == "string":
+                    st.code(data, language="text")
+                else:
+                    tags = [el for el in data if isinstance(el, bs4.Tag)]
+                    non_tags = [el for el in data if not isinstance(el, bs4.Tag)]
+                    st.metric("Results", len(data))
+                    for item in non_tags:
+                        st.code(str(item), language="text")
+                    if tags:
+                        source_elements = tags
+                        if is_deepest:
+                            render_devtools_tree(tags)
+                        else:
+                            with st.expander(f"Tree ({len(tags)} elements)", expanded=False):
+                                render_devtools_tree(tags)
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+
+        # Child element buttons — one per direct Tag child, rows of 4
+        children, total = list_child_elements(source_elements)
+        if children:
+            overflow = total - len(children)
+            label_suffix = f" (showing {len(children)} of {total})" if overflow else f" ({total})"
+            st.caption(f"Children{label_suffix}:")
+            for row_start in range(0, len(children), 4):
+                row = children[row_start : row_start + 4]
+                cols = st.columns(len(row))
+                for col_idx, child_tag in enumerate(row):
+                    with cols[col_idx]:
+                        is_active = child_tag is level.get("active_child")
+                        st.button(
+                            _collapsed_tag_label(child_tag, 1),
+                            key=f"child_{lid}_{row_start + col_idx}",
+                            use_container_width=True,
+                            type="primary" if is_active else "secondary",
+                            on_click=drill_into,
+                            args=(i, child_tag),
+                        )
+
+        if not is_deepest:
+            st.divider()
