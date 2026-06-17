@@ -187,7 +187,7 @@ def render_devtools_tree(elements: list):
         parts.append(_node_to_html(el, depth=0))
     parts.append("</body>")
     height = min(max(250, len(elements) * 120), 850)
-    components.html("\n".join(parts), height=height, scrolling=True)
+    st.iframe("\n".join(parts), height=height)
 
 
 # ── Nav level helpers ─────────────────────────────────────────────────────────
@@ -200,16 +200,23 @@ def make_level(elements: list) -> dict:
     return {"lid": next_lid(), "elements": elements, "query": "", "history": [], "active_child": None}
 
 
-def list_child_elements(source_elements: list, cap: int = 40) -> tuple:
-    children, total = [], 0
+def group_child_elements(source_elements: list, cap: int = 200) -> tuple:
+    """Group direct Tag children by tag name, preserving first-appearance order.
+
+    Returns (groups, total) where groups is an ordered list of (tag_name, [tags]).
+    Each group is capped at `cap` elements (overflow noted by the caller).
+    """
+    groups: dict = {}
+    total = 0
     for el in source_elements:
         if isinstance(el, bs4.Tag):
             for c in el.children:
                 if isinstance(c, bs4.Tag):
                     total += 1
-                    if len(children) < cap:
-                        children.append(c)
-    return children, total
+                    bucket = groups.setdefault(c.name, [])
+                    if len(bucket) < cap:
+                        bucket.append(c)
+    return list(groups.items()), total
 
 
 # ── Callbacks (run before widgets instantiate — safe to mutate session state) ─
@@ -260,6 +267,10 @@ def on_scope_change():
         st.session_state["nav_levels"] = [make_level([root_el])]
 
 
+def start_explore():
+    st.session_state["explore"] = True
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("Scraping Debugger")
@@ -284,6 +295,7 @@ with paste_tab:
         st.session_state["html_source"] = pasted
         st.session_state["soup"] = None
         st.session_state["nav_levels"] = []
+        st.session_state["explore"] = False
 
 with upload_tab:
     uploaded = st.file_uploader("Upload HTML file", type=["html", "htm", "txt"])
@@ -293,6 +305,7 @@ with upload_tab:
             st.session_state["html_source"] = content
             st.session_state["soup"] = None
             st.session_state["nav_levels"] = []
+            st.session_state["explore"] = False
         st.success(f"Loaded {uploaded.name} ({len(content):,} chars)")
 
 base_url = st.text_input(
@@ -309,10 +322,13 @@ if html_source and st.session_state["soup"] is None:
     st.session_state["soup"] = soup
     st.session_state["parser_used"] = parser
     st.session_state["nav_levels"] = []
+    st.session_state["explore"] = False
 
 soup = st.session_state.get("soup")
 if soup:
     st.caption(f"Parsed with **{st.session_state['parser_used']}** — {len(html_source):,} chars")
+    if not st.session_state["explore"]:
+        st.button("🔍 Explore elements", type="primary", on_click=start_explore)
 
 if not html_source:
     st.info("Paste or upload HTML above to get started.")
@@ -320,7 +336,7 @@ if not html_source:
 st.divider()
 
 # ── Hierarchical drill-down ───────────────────────────────────────────────────
-if soup:
+if soup and st.session_state["explore"]:
     # Seed root level when nav_levels is empty
     if not st.session_state["nav_levels"]:
         scope_init = st.session_state.get("scope_radio", "body")
@@ -406,26 +422,39 @@ if soup:
             except Exception as exc:
                 st.error(f"Error: {exc}")
 
-        # Child element buttons — one per direct Tag child, rows of 4
-        children, total = list_child_elements(source_elements)
-        if children:
-            overflow = total - len(children)
-            label_suffix = f" (showing {len(children)} of {total})" if overflow else f" ({total})"
-            st.caption(f"Children{label_suffix}:")
-            for row_start in range(0, len(children), 4):
-                row = children[row_start : row_start + 4]
-                cols = st.columns(len(row))
-                for col_idx, child_tag in enumerate(row):
-                    with cols[col_idx]:
-                        is_active = child_tag is level.get("active_child")
-                        st.button(
-                            _collapsed_tag_label(child_tag, 1),
-                            key=f"child_{lid}_{row_start + col_idx}",
-                            use_container_width=True,
-                            type="primary" if is_active else "secondary",
-                            on_click=drill_into,
-                            args=(i, child_tag),
-                        )
+        # Child element buttons — grouped by tag name into collapsible menus
+        groups, total = group_child_elements(source_elements)
+        active = level.get("active_child")
+
+        if groups:
+            ngroups = len(groups)
+            st.caption(f"Children ({total} across {ngroups} tag{'s' if ngroups != 1 else ''}):")
+            btn_idx = 0
+            for tag_name, tags in groups:
+                group_has_active = any(t is active for t in tags)
+                with st.expander(f"<{tag_name}>  ×{len(tags)}", expanded=group_has_active):
+                    for row_start in range(0, len(tags), 4):
+                        row = tags[row_start : row_start + 4]
+                        cols = st.columns(len(row))
+                        for col_idx, child_tag in enumerate(row):
+                            with cols[col_idx]:
+                                st.button(
+                                    _collapsed_tag_label(child_tag, 1),
+                                    key=f"child_{lid}_{btn_idx}",
+                                    use_container_width=True,
+                                    type="primary" if child_tag is active else "secondary",
+                                    on_click=drill_into,
+                                    args=(i, child_tag),
+                                )
+                                btn_idx += 1
+        elif not level["query"]:
+            # Leaf element on a plain drill — show its (cheap) content so it isn't blank
+            st.caption("No child elements — content:")
+            render_devtools_tree(source_elements)
+
+        # Lazy full-tree inspection (deferred render keeps the UI smooth)
+        if groups and st.toggle("Show full tree", key=f"tree_{lid}"):
+            render_devtools_tree(source_elements)
 
         if not is_deepest:
             st.divider()
